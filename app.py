@@ -1,50 +1,93 @@
-# app.py
-import streamlit as st
-import pandas as pd
-import joblib
 import os
+import logging
+import traceback
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import joblib
+import pandas as pd
 
-# === CONFIG ===
-MODEL_FILENAME = "xgb_final_model.joblib"   # Rename your uploaded file to this and keep in same folder as app.py
-FEATURES = ["Rainfall", "Fertilizer", "Temperature"]  # Update to match your model training features
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# === LOAD MODEL ===
-MODEL_PATH = MODEL_FILENAME
-model = None
-try:
-    model = joblib.load(MODEL_PATH)
-    load_msg = f"Loaded model: {MODEL_FILENAME}"
-except Exception as e:
-    model = None
-    load_msg = f"Model not loaded: {e}"
+app = Flask(__name__)
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-# === STREAMLIT UI ===
-st.title("🌾 Crop Yield Prediction (XGBoost)")
-st.caption(load_msg)
+MODEL_PATH = os.environ.get("MODEL_FILE", "final_pipeline.joblib")
+predictor = None
 
-st.header("Enter input features")
+def try_load(path):
+    try:
+        obj = joblib.load(path)
+        logger.info(f"Loaded model from {path}")
+        return obj
+    except Exception as e:
+        logger.exception(f"Failed loading {path}: {e}")
+        return None
 
-inputs = []
-cols = st.columns(2)
-for i, feat in enumerate(FEATURES):
-    if i % 2 == 0:
-        val = cols[0].number_input(feat, value=0.0)
-    else:
-        val = cols[1].number_input(feat, value=0.0)
-    inputs.append(val)
+predictor = try_load(MODEL_PATH)
 
-X_new = pd.DataFrame([inputs], columns=FEATURES)
+# fallback: if wrapper not present try to assemble from encoder + raw model
+if predictor is None:
+    try:
+        encoder = joblib.load("encoder.pkl")
+        raw_model = joblib.load("xgb_final_model.joblib")
+        logger.info("Loaded encoder and raw model; building runtime wrapper.")
 
-st.write("Input preview:")
-st.dataframe(X_new)
+        class PredictorWrapper:
+            def __init__(self, encoder, model):
+                self.encoder = encoder
+                self.model = model
+                self.cat_cols = list(encoder.feature_names_in_)
+                self.expected = list(model.feature_names_in_)
 
-if st.button("Predict Yield"):
-    if model is None:
-        st.error("❌ Model not loaded. Make sure xgb_final_model.joblib is in the same folder as app.py.")
-    else:
-        try:
-            pred = model.predict(X_new)[0]
-            st.success(f"✅ Predicted Yield: {pred:.4f}")
-        except Exception as e:
-            st.error(f"Prediction error: {e}")
-            st.write("Check terminal for full traceback.")
+            def prepare(self, raw_df, fallback=True):
+                raw_df = raw_df.copy()
+                cat_df = raw_df[self.cat_cols].astype(str).copy()
+                if fallback:
+                    for i, col in enumerate(self.cat_cols):
+                        allowed = set(self.encoder.categories_[i])
+                        cat_df[col] = cat_df[col].where(cat_df[col].isin(allowed),
+                                                        "Unknown" if "Unknown" in allowed else list(self.encoder.categories_[i])[0])
+                enc_arr = self.encoder.transform(cat_df)
+                enc_df = pd.DataFrame(enc_arr, columns=self.cat_cols, index=raw_df.index)
+                rows = []
+                for idx, _ in raw_df.iterrows():
+                    row = {}
+                    for c in self.cat_cols:
+                        row[c] = float(enc_df.at[idx, c])
+                    for nf in [f for f in self.expected if f not in self.cat_cols]:
+                        row[nf] = float(raw_df.at[idx, nf]) if nf in raw_df.columns else 0.0
+                    rows.append(row)
+                return pd.DataFrame(rows, columns=self.expected)
+
+            def predict(self, raw_df):
+                X = self.prepare(raw_df)
+                return self.model.predict(X)
+
+        predictor = PredictorWrapper(encoder, raw_model)
+    except Exception:
+        logger.exception("Runtime wrapper build failed; predictor remains None.")
+        predictor = None
+
+@app.get("/")
+def health():
+    return jsonify({"status": "ok", "model_loaded": predictor is not None})
+
+@app.post("/predict")
+def predict_route():
+    if predictor is None:
+        return jsonify({"error": "Model not loaded"}), 503
+    try:
+        req = request.get_json(force=True)
+        data = req.get("data") if isinstance(req, dict) and "data" in req else req
+        if data is None:
+            return jsonify({"error": "No JSON body found"}), 400
+        df = pd.DataFrame([data])
+        preds = predictor.predict(df)
+        return jsonify({"prediction": list(map(float, preds))})
+    except Exception as e:
+        logger.exception("Prediction failed")
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
